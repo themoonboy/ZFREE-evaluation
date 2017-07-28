@@ -1,0 +1,1392 @@
+(***************************************************************************
+ *                                                                         *
+ *  Formal Verification of TLS 1.3 Full Handshake Protocol Using ProVerif  *
+ *                                                                         *
+ *  Kenichi Arai                                                           *
+ *                                                                         *
+ *  Copyright (C) Nagasaki University 2015-2016                            *
+ *                                                                         *
+ ***************************************************************************)
+
+(*
+    This file is free software; you can redistribute it and/or modify 
+    it under the terms of the BSD License.
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+    See the BSD license for more details (in file LICENSEBSD).
+*)
+
+(* 
+The Transport Layer Security (TLS) Protocol Version 1.3 
+    draft-ietf-tls-tls13-11 (January 22, 2016)
+
+===================================================================================
+       Client                                                   Server
+
+Key  / ClientHello
+Exch \  + key_share              -------->
+                                                           ServerHello  \ Key
+                                                           + key_share  / Exch
+                                                 {EncryptedExtensions}  ^
+                                                 {CertificateRequest*}  | Server
+                                                {ServerConfiguration*}  v Params
+                                                        {Certificate*}  ^
+                                                  {CertificateVerify*}  | Auth
+                                 <--------                  {Finished}  v
+     ^ {Certificate*}
+Auth | {CertificateVerify*}
+     v {Finished}                -------->
+       [Application Data]        <------->         [Application Data]
+
+
+              + Indicates extensions sent in the
+                previously noted message.
+
+              * Indicates optional or situation-dependent
+                messages that are not always sent.
+
+              {} Indicates messages protected using keys
+                 derived from the ephemeral secret.
+
+              [] Indicates messages protected using keys
+                 derived from the master secret.
+===================================================================================
+
+             Message flow for full TLS Handshake
+*)
+
+free c: channel.
+
+(* Null, Empty: const. *)
+const null: bitstring [data].
+const empty: bitstring [data].
+
+(* ServerConfiguration: const. *)
+const early_data_type: bitstring [data].
+
+(* HMAC: const. *)
+const hmac_opad: bitstring [data].
+const hmac_ipad: bitstring [data].
+
+(* HKDF: const. *)
+const hkdf_zeros: bitstring [data]. 
+(* HKDF: label *)
+const HKDF_SERVER_FINISHED: bitstring [data].
+const HKDF_CLIENT_FINISHED: bitstring [data].
+const HKDF_LABAL_EXPANDED_STATIC_SECRET: bitstring [data].
+const HKDF_LABEL_EXPANDED_EPHEMERAL_SECRET: bitstring [data].
+const HKDF_LABEL_FINISHED_SECRET: bitstring [data].
+const HKDF_LABEL_TRAFFIC_SECRET: bitstring [data].
+(*
+const HKDF_LABEL_RESUMPTION_MASTER_SECRET: bitstring [data].
+const HKDF_LABEL_EXPORTER_MASTER_SECRET: bitstring [data].
+*)
+(* HKDF: const. - label (Phase) *)
+(*
+const HKDF_LABEL_EARLY_HANDSHAKE_KEY_EXPANSION: bitstring [data].
+const HKDF_LABEL_EARLY_APPLICATION_DATA_KEY_EXPANSION: bitstring [data].
+*)
+const HKDF_LABEL_HANDSHAKE_KEY_EXPANSION: bitstring [data].
+const HKDF_LABEL_APPLICATION_DATA_KEY_EXPANSION: bitstring [data].
+(* HKDF: const. - label (Purpose) *)
+const HKDF_LABEL_CLIENT_WRITE_KEY: bitstring [data].
+const HKDF_LABEL_SERVER_WRITE_KEY: bitstring [data].
+const HKDF_LABEL_CLIENT_WRITE_IV: bitstring [data].
+const HKDF_LABEL_SERVER_WRITE_IV: bitstring [data].
+(* HKDF: const. - length *)
+const hkdf_length_mss: bitstring [data].
+const hkdf_length_mes: bitstring [data].
+const hkdf_length_client_finished_key: bitstring [data].
+const hkdf_length_server_finished_key: bitstring [data].
+(* HKDF: const. - length (Handshake) *)
+const hkdf_length_handshake_client_write_key: bitstring [data].
+const hkdf_length_handshake_server_write_key: bitstring [data].
+const hkdf_length_handshake_client_write_IV: bitstring [data].
+const hkdf_length_handshake_server_write_IV: bitstring [data].
+(* HKDF: const. - length (Application) *)
+const hkdf_length_application_client_write_key: bitstring [data].
+const hkdf_length_application_server_write_key: bitstring [data].
+const hkdf_length_application_client_write_IV: bitstring [data].
+const hkdf_length_application_server_write_IV: bitstring [data].
+const hkdf_length_traffic_secret: bitstring [data].
+
+(******************************************************************)
+(* MiddleBox const lable *)
+const HKDF_LABEL_MIDDLEBOX_WRITE_KEY: bitstring [data].
+const HKDF_LABEL_MIDDLEBOX_WRITE_IV: bitstring [data].
+const hkdf_length_middlebox_finished_key: bitstring [data].
+const hkdf_length_handshake_middlebox_write_key: bitstring [data].
+const hkdf_length_handshake_middlebox_write_IV: bitstring [data].
+const hkdf_length_application_middlebox_write_key: bitstring [data].
+const hkdf_length_application_middlebox_write_IV: bitstring [data].
+const middlebox_seq_num: bitstring  [data].
+free HostInfoM: bitstring.
+
+const hkdf_length_context_key: bitstring [data].
+const HKDF_LABEL_CONTEXT_WRITE_KEY: bitstring [data].
+const HKDF_LABEL_CONTEXT_WRITE_IV: bitstring [data].
+
+(******************************************************************)
+
+(* AEAD: const. *)
+const client_seq_num: bitstring  [data].
+const server_seq_num: bitstring  [data].
+const context_seq_num: bitstring [data].
+const record_type: bitstring  [data].
+const record_version: bitstring  [data].
+
+(* Host Information *)
+free HostInfoC, HostInfoS, HostInfoCA: bitstring.
+
+
+(******************************************************************)
+(* Hash *)
+fun H(bitstring): bitstring.
+
+(* HMAC *)
+reduc forall key: bitstring, text: bitstring; 
+      HMAC(key, text) = H(( (key, hmac_opad), H(((key, hmac_ipad), text)) )).
+
+(* HKDF *)
+reduc forall salt: bitstring, IKM: bitstring;
+      HKDF_Extract(salt, IKM) = H(( (salt, hmac_opad), H(((salt, hmac_ipad), IKM)) )). (* HKDF-extract *)
+
+reduc forall PRK: bitstring, info: bitstring, L: bitstring;
+      HKDF_Expand(PRK, info, L) = H(( (PRK, hmac_opad), H(((PRK, hmac_ipad), (info, L))) )). (* HKDF-expand *)
+
+(* Signature *)
+fun sign(bitstring, bitstring): bitstring.
+fun pk(bitstring): bitstring.
+  reduc forall x: bitstring, sk: bitstring; verify(sign(x, sk), x, pk(sk)) = true.
+
+(* Diffie-Hellman *)
+const g: bitstring.
+fun exp(bitstring, bitstring): bitstring. (* exp(g,x) = g^x *)
+  equation forall x: bitstring, y: bitstring; exp(exp(g, x), y) = exp(exp(g, y), x). (* (g^x)^y = (g^y)^x *)
+
+(* XOR *)
+const zeros: bitstring. (* 00..0 *)
+fun xor(bitstring,bitstring):bitstring.
+  equation forall x:bitstring,y:bitstring; xor(xor(x,y),y) = x.
+  equation forall x:bitstring; xor(x,x) = zeros.  (* xor(x,x) = 00..0 *)
+  equation forall x:bitstring; xor(zeros,x) = x.  (* xor(00..0,x) = x *)
+  equation forall x:bitstring; xor(x,zeros) = x.  (* xor(x,00..0) = x *)
+
+(* AEAD: Authenticated Encryption with Associated Data *)
+(* Encryption scheme *)
+fun encrypt(bitstring, bitstring, bitstring): bitstring.
+  reduc forall x:bitstring, k:bitstring, r:bitstring; decrypt(encrypt(x,k,r),k,r) = x.
+(* MAC *)
+fun mac(bitstring, bitstring): bitstring.
+  reduc forall x: bitstring, k: bitstring; verify_mac(mac(x, k), x, k) = true.
+(* Encrypt-then-MAC (generic composition)[R02] *)
+(* [R02] P.Rogaway, "Authenticated-encryption with associated-data,"
+   ACM Conference on Computer and Communications Security (CCS'02), 
+   pp.98-107, ACM press, 2002 *)
+reduc forall k: bitstring, n: bitstring, p:bitstring, ad:bitstring; 
+  AEAD_Encrypt(k, n, p, ad) = (encrypt(p, k, n), mac((n, ad, encrypt(p, k, n)), k)).
+reduc forall k: bitstring, n: bitstring, p:bitstring, ad:bitstring; 
+  AEAD_Decrypt(k, n, (encrypt(p, k, n), mac((n, ad, encrypt(p, k, n)), k)), ad) = p.
+
+(* increment function *)
+fun inc(bitstring): bitstring.
+
+
+(******************************************************************)
+(* Queries: secrecy *) 
+free packet: bitstring [private].
+
+query attacker(packet). 
+
+
+(* Queries1: authentication Server and Client *) 
+event endClient(bitstring, bitstring, bitstring, bitstring, bitstring).
+event beginClient(bitstring, bitstring, bitstring, bitstring, bitstring).
+
+query s: bitstring, t: bitstring, u: bitstring, v: bitstring, w: bitstring; 
+  inj-event(endClient(s,t,u,v,w)) ==> inj-event(beginClient(s,t,u,v,w)).
+
+
+
+(* Queries2: authentication Server and Middlebox *) 
+event endMiddlebox_S(bitstring, bitstring, bitstring, bitstring, bitstring).
+event beginMiddlebox_S(bitstring, bitstring, bitstring, bitstring, bitstring).
+
+query s_2: bitstring, t_2: bitstring, u_2: bitstring, v_2: bitstring, w_2: bitstring; 
+  inj-event(endMiddlebox_S(s_2,t_2,u_2,v_2,w_2)) ==> inj-event(beginMiddlebox_S(s_2,t_2,u_2,v_2,w_2)).
+
+
+
+(* Queries 3: authentication Middlebox and Client *) 
+event endMiddlebox_C(bitstring, bitstring, bitstring, bitstring, bitstring).
+event beginMiddlebox_C(bitstring, bitstring, bitstring, bitstring, bitstring).
+
+query s_3: bitstring, t_3: bitstring, u_3: bitstring, v_3: bitstring, w_3: bitstring; 
+  inj-event(endMiddlebox_C(s_3,t_3,u_3,v_3,w_3)) ==> inj-event(beginMiddlebox_C(s_3,t_3,u_3,v_3,w_3)).
+
+(* Queries: authentication Middlebox and Client *) 
+event endtest(bitstring, bitstring).
+event begintest(bitstring, bitstring).
+
+query a: bitstring,b: bitstring; 
+  inj-event(endtest(a, b)) ==> inj-event(begintest(a,b)).
+
+(******************************************************************)
+(* Client process *)
+
+let processClient(pkCA: bitstring)=
+    (* Setup *)
+      in(c, (client_version: bitstring, client_cipher_suites: bitstring, 
+             legacy_compression_methods: bitstring));
+
+    (* ClientHello + key_share *)
+      new client_random: bitstring;
+      new client_legacy_session_id: bitstring;
+      new X: bitstring; 
+      let client_key_shares = exp(g, X) in  (* g^X *)
+      let client_hello = (client_version, client_random, client_legacy_session_id, 
+                          client_cipher_suites, legacy_compression_methods, 
+                          client_key_shares) in
+
+
+    (* Client output *)
+      out(c, client_hello);
+
+    (* Client input *)
+      in(c, (server_hello: bitstring, enc_encrypted_extensions: bitstring, 
+            enc_server_configuration: bitstring, enc_server_certificate: bitstring, enc_server_certificate_verify: bitstring, enc_server_finished: bitstring,            
+            middlebox_hello_C: bitstring, enc_encrypted_extensions_C: bitstring, enc_middlebox_configuration_C: bitstring, 
+            enc_middlebox_certificate_C: bitstring, enc_middlebox_certificate_verify_C: bitstring, enc_middlebox_finished_C: bitstring));
+      let (server_version: bitstring, server_random: bitstring, 
+           server_cipher_suite: bitstring, server_key_share: bitstring) = server_hello in
+
+      let (middlebox_version: bitstring, middlebox_random: bitstring,
+           middlebox_cipher_suite: bitstring, middlebox_key_share_C: bitstring) =
+           middlebox_hello_C in
+
+      if server_version = client_version &&
+         server_cipher_suite = client_cipher_suites then 
+
+    (* SS, ES, xSS, xES *) (* Full handshake: SS = ES *)
+      let static_secret = exp(server_key_share, X) in     (* SS: (g^{Y})^X = g^{XY} *)
+      let ephemeral_secret = exp(server_key_share, X) in  (* ES: (g^{Y})^X = g^{XY} *)
+      let xss = HKDF_Extract(hkdf_zeros, static_secret) in
+      let xes = HKDF_Extract(hkdf_zeros, ephemeral_secret) in
+
+    (* Handshake traffic keys: client_write_key, server_write_key, 
+                               client_write_iv, server_write_iv *)
+      let handshake_context = H((client_hello, server_hello)) in
+
+      let handshake_client_write_key = HKDF_Expand(
+              xes, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_CLIENT_WRITE_KEY), handshake_context), 
+        hkdf_length_handshake_client_write_key) in
+
+      let handshake_server_write_key = HKDF_Expand(
+              xes, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_SERVER_WRITE_KEY), handshake_context), 
+        hkdf_length_handshake_server_write_key) in
+
+      let handshake_client_write_iv = HKDF_Expand(
+              xes, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_CLIENT_WRITE_IV), handshake_context), 
+        hkdf_length_handshake_client_write_IV) in
+
+      let handshake_server_write_iv = HKDF_Expand(
+              xes, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_SERVER_WRITE_IV), handshake_context), 
+        hkdf_length_handshake_server_write_IV) in
+
+    (* Decryption: encrypted_extensions, server_configuration, server_certificate, 
+                   server_certificate_verify, server_finished *)
+      (* AEAD: additional_data = empty *)
+      let handshake_server_write_nonce_0 = xor(handshake_server_write_iv, 
+                                               server_seq_num) in
+      let (encrypted_extensions:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_server_write_key, 
+              handshake_server_write_nonce_0, 
+        enc_encrypted_extensions, 
+        empty) in 
+
+      let handshake_server_write_nonce_1 = xor(handshake_server_write_iv, 
+                                               inc(server_seq_num)) in
+      let (server_configuration:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_server_write_key, 
+              handshake_server_write_nonce_1, 
+        enc_server_configuration, 
+        empty) in 
+
+      let handshake_server_write_nonce_2 = xor(handshake_server_write_iv, 
+                                               inc(inc(server_seq_num))) in
+      let (server_certificate:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_server_write_key, 
+              handshake_server_write_nonce_2, 
+        enc_server_certificate, 
+        empty) in 
+
+      let handshake_server_write_nonce_3 = xor(handshake_server_write_iv, 
+                                               inc(inc(inc(server_seq_num)))) in
+      let (server_certificate_verify:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_server_write_key, 
+        handshake_server_write_nonce_3, 
+        enc_server_certificate_verify, 
+        empty) in 
+
+      let handshake_server_write_nonce_4 = xor(handshake_server_write_iv, 
+                                               inc(inc(inc(inc(server_seq_num))))) in
+      let (server_finished:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_server_write_key, 
+        handshake_server_write_nonce_4, 
+        enc_server_finished, 
+        empty) in 
+
+      if encrypted_extensions = empty then 
+
+      let (=HostInfoCA, =HostInfoS, pkS: bitstring, signCA_pkS: bitstring) = server_certificate in 
+      if verify(signCA_pkS, H((HostInfoCA, HostInfoS, pkS)), pkCA) = true then 
+
+      let handshake_hashed_data = H((client_hello, server_hello, encrypted_extensions, 
+                                     server_configuration, server_certificate)) in 
+      if verify(server_certificate_verify, handshake_hashed_data, pkS) = true then 
+
+    (* mSS, mES, master_secret, traffic_secret_0 *) 
+      let handshake_hash = H((client_hello, server_hello, encrypted_extensions,
+                              server_configuration, server_certificate, 
+                              server_certificate_verify)) in
+      let mss = HKDF_Expand(
+              xss, 
+        (HKDF_LABAL_EXPANDED_STATIC_SECRET, handshake_hash), 
+        hkdf_length_mss) in
+      let mes = HKDF_Expand(
+              xes, 
+        (HKDF_LABEL_EXPANDED_EPHEMERAL_SECRET, handshake_hash), 
+        hkdf_length_mes) in
+      let master_secret = HKDF_Extract(mss, mes) in 
+      let traffic_secret_0 = HKDF_Expand(
+              master_secret, 
+        (HKDF_LABEL_TRAFFIC_SECRET, handshake_hash), 
+        hkdf_length_traffic_secret) in
+
+      let server_finished_handshake_context = H((client_hello, server_hello, encrypted_extensions,
+                                                 server_configuration, server_certificate, 
+                                                 server_certificate_verify)) in
+      let server_finished_key = HKDF_Expand(
+              master_secret, 
+        (HKDF_SERVER_FINISHED, empty), 
+        hkdf_length_server_finished_key) in
+      if server_finished = HMAC(server_finished_key, server_finished_handshake_context) then
+
+    (* Certificate: optional *)
+      (* Omitted *)
+    (* CertificateVerify: optional *)
+      (* Omitted *)
+
+    (* Finished *) (* 1-RTT (Client) *)
+      let client_finished_handshake_context = H((client_hello, server_hello, encrypted_extensions,
+                                                 server_configuration, server_certificate, 
+                                                 server_certificate_verify, server_finished)) in
+      let client_finished_key = HKDF_Expand(
+              master_secret, 
+        (HKDF_CLIENT_FINISHED, empty), 
+        hkdf_length_client_finished_key) in
+      let client_finished = HMAC(client_finished_key, client_finished_handshake_context) in
+
+    (* Encryption: client_finished *)
+      let handshake_client_write_nonce_0 = xor(handshake_client_write_iv, 
+                                               client_seq_num) in
+      let enc_client_finished = AEAD_Encrypt(
+              handshake_client_write_key, 
+        handshake_client_write_nonce_0, 
+        (client_finished, record_type), 
+        empty) in  
+
+
+    if middlebox_version = client_version &&
+         middlebox_cipher_suite = client_cipher_suites then
+
+    (* Middlebox ES, xES*)
+      let static_secret_M = exp(middlebox_key_share_C, X) in
+      let ephemeral_secret_M = exp(middlebox_key_share_C, X) in
+      let xss_M = HKDF_Extract(hkdf_zeros, static_secret_M) in
+      let xes_M = HKDF_Extract(hkdf_zeros, ephemeral_secret_M) in
+
+    (* Middlebox Handshake traffic keys: middlebox_write_key, client_write_key, 
+                               middlebox_write_iv, client_write_iv *)
+      let handshake_context_M = H((middlebox_hello_C, client_hello)) in
+
+      let handshake_middlebox_write_key = HKDF_Expand(
+              xes_M, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_MIDDLEBOX_WRITE_KEY), handshake_context_M), 
+        hkdf_length_handshake_middlebox_write_key) in
+
+      let handshake_client_write_key_M = HKDF_Expand(
+              xes_M, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_CLIENT_WRITE_KEY), handshake_context_M), 
+        hkdf_length_handshake_client_write_key) in
+
+      let handshake_middlebox_write_iv = HKDF_Expand(
+              xes_M, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_MIDDLEBOX_WRITE_IV), handshake_context_M), 
+        hkdf_length_handshake_middlebox_write_IV) in
+
+      let handshake_client_write_iv_M = HKDF_Expand(
+              xes_M, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_CLIENT_WRITE_IV), handshake_context_M), 
+        hkdf_length_handshake_client_write_IV) in
+
+    (* Decryption: encrypted_extensions_C, middlebox_configuration_C, middlebox_certificate_C, middlebox_certificate_verify_C, middlebox_finished_C *)
+      (* AEAD: additional_data = empty *)
+      let handshake_middlebox_write_nonce_0 = xor(handshake_middlebox_write_iv, 
+                                               middlebox_seq_num) in
+      let (encrypted_extensions_C:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_middlebox_write_key, 
+              handshake_middlebox_write_nonce_0, 
+        enc_encrypted_extensions_C, 
+        empty) in 
+
+      let handshake_middlebox_write_nonce_1 = xor(handshake_middlebox_write_iv, 
+                                               inc(middlebox_seq_num)) in
+      let (middlebox_configuration:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_middlebox_write_key, 
+              handshake_server_write_nonce_1, 
+        enc_middlebox_configuration_C, 
+        empty) in 
+
+      let handshake_middlebox_write_nonce_2 = xor(handshake_middlebox_write_iv, 
+                                               inc(inc(middlebox_seq_num))) in
+      let (middlebox_certificate:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_middlebox_write_key, 
+              handshake_middlebox_write_nonce_2, 
+        enc_middlebox_certificate_C, 
+        empty) in 
+
+      let handshake_middlebox_write_nonce_3 = xor(handshake_middlebox_write_iv, 
+                                               inc(inc(inc(middlebox_seq_num)))) in
+      let (middlebox_certificate_verify:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_middlebox_write_key, 
+        handshake_middlebox_write_nonce_3, 
+        enc_middlebox_certificate_verify_C, 
+        empty) in 
+
+      let handshake_middlebox_write_nonce_4 = xor(handshake_middlebox_write_iv, 
+                                               inc(inc(inc(inc(middlebox_seq_num))))) in
+      let (middlebox_finished:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_middlebox_write_key, 
+        handshake_middlebox_write_nonce_4, 
+        enc_middlebox_finished_C, 
+        empty) in
+
+      if encrypted_extensions_C = empty then 
+
+      let (=HostInfoCA, =HostInfoM, pkM: bitstring, signCA_pkM: bitstring) = middlebox_certificate in 
+      if verify(signCA_pkM, H((HostInfoCA, HostInfoM, pkM)), pkCA) = true then 
+
+      let handshake_hashed_data_M = H((client_hello, middlebox_hello_C, encrypted_extensions_C, 
+                                     middlebox_configuration, middlebox_certificate)) in 
+      if verify(middlebox_certificate_verify, handshake_hashed_data_M, pkM) = true then
+
+      (* mSS, mES, master_secret, traffic_secret_0 *) 
+      let handshake_hash_M = H((client_hello, middlebox_hello_C, encrypted_extensions_C,
+                              middlebox_configuration, middlebox_certificate, 
+                              middlebox_certificate_verify)) in
+      let mss_M = HKDF_Expand(
+              xss_M, 
+        (HKDF_LABAL_EXPANDED_STATIC_SECRET, handshake_hash_M), 
+        hkdf_length_mss) in
+      let mes_M = HKDF_Expand(
+              xes_M, 
+        (HKDF_LABEL_EXPANDED_EPHEMERAL_SECRET, handshake_hash_M), 
+        hkdf_length_mes) in
+      let master_secret_M = HKDF_Extract(mss_M, mes_M) in 
+      let traffic_secret_0_M = HKDF_Expand(
+              master_secret_M, 
+        (HKDF_LABEL_TRAFFIC_SECRET, handshake_hash_M), 
+        hkdf_length_traffic_secret) in
+
+      let middlebox_finished_handshake_context = H((client_hello, middlebox_hello_C, encrypted_extensions_C,
+                                                 middlebox_configuration, middlebox_certificate, 
+                                                 middlebox_certificate_verify)) in
+      let middlebox_finished_key = HKDF_Expand(
+              master_secret_M, 
+        (HKDF_SERVER_FINISHED, empty), 
+        hkdf_length_middlebox_finished_key) in
+      if middlebox_finished = HMAC(middlebox_finished_key, middlebox_finished_handshake_context) then
+
+      (* Finished Middlebox *) (* 1-RTT (Client) *)
+      let client_finished_handshake_context_M = H((client_hello, middlebox_hello_C, encrypted_extensions_C,
+                                                 middlebox_configuration, middlebox_certificate, 
+                                                 middlebox_certificate_verify, middlebox_finished)) in
+      let client_finished_key_M = HKDF_Expand(
+              master_secret_M, 
+        (HKDF_CLIENT_FINISHED, empty), 
+        hkdf_length_client_finished_key) in
+      let client_finished_M = HMAC(client_finished_key_M, client_finished_handshake_context_M) in
+
+    (* Encryption: client_finished *)
+      let handshake_client_write_nonce_0_M = xor(handshake_client_write_iv_M, 
+                                               client_seq_num) in
+      let enc_client_finished_M = AEAD_Encrypt(
+              handshake_client_write_key_M, 
+        handshake_client_write_nonce_0_M, 
+        (client_finished_M, record_type), 
+        empty) in 
+
+
+    (* Client output *)
+      out(c, (enc_client_finished, enc_client_finished_M));
+
+    (* Event end: authentication *)
+      event endClient(client_random, server_random, client_cipher_suites, xes, traffic_secret_0); 
+
+      event endMiddlebox_C(client_random, middlebox_random, client_cipher_suites, xes_M, traffic_secret_0_M); 
+    
+
+    (* Application data traffic keys: client_write_key, server_write_key, 
+                                      client_write_iv, server_write_iv *)
+      let application_handshake_context = H((client_hello, server_hello, encrypted_extensions,
+                                             server_configuration, server_certificate, 
+                                             server_certificate_verify, server_finished)) in
+
+      let application_client_write_key = HKDF_Expand(
+              traffic_secret_0, 
+        ((HKDF_LABEL_APPLICATION_DATA_KEY_EXPANSION, HKDF_LABEL_CLIENT_WRITE_KEY), 
+                application_handshake_context), 
+        hkdf_length_application_client_write_key) in
+
+      let application_server_write_key = HKDF_Expand(
+              traffic_secret_0, 
+        ((HKDF_LABEL_APPLICATION_DATA_KEY_EXPANSION, HKDF_LABEL_SERVER_WRITE_KEY), 
+                application_handshake_context), 
+        hkdf_length_application_server_write_key) in
+
+      let application_client_write_iv = HKDF_Expand(
+              traffic_secret_0, 
+        ((HKDF_LABEL_APPLICATION_DATA_KEY_EXPANSION, HKDF_LABEL_CLIENT_WRITE_IV), 
+                application_handshake_context), 
+        hkdf_length_application_client_write_IV) in
+
+      let application_server_write_iv = HKDF_Expand(
+              traffic_secret_0, 
+        ((HKDF_LABEL_APPLICATION_DATA_KEY_EXPANSION, HKDF_LABEL_SERVER_WRITE_IV), 
+                application_handshake_context), 
+        hkdf_length_application_server_write_IV) in
+
+    (* Application Data *) (* Secrecy *)
+      let application_client_write_nonce_1 = xor(application_client_write_iv, 
+                                                 inc(client_seq_num)) in 
+      out(c, AEAD_Encrypt(
+                  application_client_write_key, 
+                  application_client_write_nonce_1, 
+                  (packet, record_type), 
+                  empty));
+
+      event endtest(packet, server_certificate);
+
+      0.
+
+(******************************************************************)
+(* middlebox process *)
+let processMiddlebox(skM: bitstring, pkM: bitstring, middlebox_certificate: bitstring, pkCA: bitstring)=
+(* Setup *)
+      in(c, (middlebox_version: bitstring, middlebox_cipher_suite: bitstring));
+
+      (* client_hello intercept *)
+      in(c, client_hello: bitstring);
+
+      (* client_middlebox_hello + key_share *)
+      new middlebox_random: bitstring;
+      new Z1: bitstring;
+      new Z2: bitstring;
+      let middlebox_key_share_C = exp(g, Z1) in 
+      let middlebox_key_share_S = exp(g, Z2) in
+
+      (* middlebox_hello_C - CM, middlebox_hello_S - SM *)
+      let middlebox_hello_C = (middlebox_version, middlebox_random,
+           middlebox_cipher_suite, middlebox_key_share_C) in 
+      let middlebox_hello_S = (middlebox_version, middlebox_random,
+           middlebox_cipher_suite, middlebox_key_share_S) in 
+      let client_middlebox_hello = (client_hello, middlebox_hello_S) in 
+
+      (* middlebox ouput to server*)
+      out(c, client_middlebox_hello);
+
+      (* server output to middlebox *)
+      in(c, (server_hello: bitstring, enc_encrypted_extensions: bitstring, enc_server_configuration: bitstring, 
+              enc_server_certificate: bitstring, enc_server_certificate_verify: bitstring, enc_server_finished: bitstring, 
+              enc_encrypted_extensions_M: bitstring, enc_server_configuration_M: bitstring, 
+              enc_server_certificate_M: bitstring, enc_server_certificate_verify_M: bitstring, enc_server_finished_M: bitstring));
+
+      (************************************************************)
+      (* middlebox key computation *)
+
+      let (client_version: bitstring, client_random: bitstring, client_legacy_session_id: bitstring,
+           client_cipher_suites: bitstring, legacy_compression_methods: bitstring, 
+           client_key_shares: bitstring) = client_hello in
+      let (server_version: bitstring, server_random: bitstring, 
+           server_cipher_suite: bitstring, server_key_share: bitstring) = server_hello in
+
+      (* Key C-M Computation *)
+      let static_secret_C = exp(client_key_shares, Z1) in
+      let ephemeral_secret_C = exp(client_key_shares, Z1) in
+      let xss_C = HKDF_Extract(hkdf_zeros, static_secret_C) in
+      let xes_C = HKDF_Extract(hkdf_zeros, ephemeral_secret_C) in
+
+      (* Key C-M Handshake traffic keys *)
+      let handshake_context_C = H((middlebox_hello_C, client_hello)) in
+
+      let handshake_middlebox_write_key_C = HKDF_Expand(
+              xes_C, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_MIDDLEBOX_WRITE_KEY), handshake_context_C), 
+        hkdf_length_handshake_middlebox_write_key) in
+
+      let handshake_client_write_key = HKDF_Expand(
+              xes_C, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_CLIENT_WRITE_KEY), handshake_context_C), 
+        hkdf_length_handshake_client_write_key) in
+
+      let handshake_middlebox_write_iv_C = HKDF_Expand(
+              xes_C, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_MIDDLEBOX_WRITE_IV), handshake_context_C), 
+        hkdf_length_handshake_middlebox_write_IV) in
+
+      let handshake_client_write_iv = HKDF_Expand(
+              xes_C, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_CLIENT_WRITE_IV), handshake_context_C), 
+        hkdf_length_handshake_client_write_IV) in
+
+      let encrypted_extensions = empty in
+
+      (* Key C-M Middlebox configuration: optional *) 
+      new configuration_id: bitstring;
+      new expiration_date: bitstring;
+      let middlebox_configuration_C = (configuration_id, expiration_date, middlebox_key_share_C, 
+                                  early_data_type) in
+
+      (* CertificateVerify: optional *)
+      let handshake_hashed_data_C = H((client_hello, middlebox_hello_C, encrypted_extensions,
+                                     middlebox_configuration_C, middlebox_certificate)) in 
+      let middlebox_certificate_verify_C = sign(handshake_hashed_data_C, skM) in
+
+       (* mss_C, mES_C, master_secret_C, traffic_secret_0_C *) 
+      let handshake_hash_C = H((middlebox_hello_C, client_hello, encrypted_extensions,
+                              middlebox_configuration_C, middlebox_certificate, 
+                              middlebox_certificate_verify_C)) in
+      let mss_C = HKDF_Expand(
+              xss_C, 
+        (HKDF_LABAL_EXPANDED_STATIC_SECRET, handshake_hash_C), 
+        hkdf_length_mss) in
+                                  
+      let mes_C = HKDF_Expand(
+              xes_C, 
+        (HKDF_LABEL_EXPANDED_EPHEMERAL_SECRET, handshake_hash_C), 
+        hkdf_length_mes) in
+      let master_secret_C = HKDF_Extract(mss_C, mes_C) in 
+      let traffic_secret_0_C = HKDF_Expand(
+              master_secret_C, 
+        (HKDF_LABEL_TRAFFIC_SECRET, handshake_hash_C), 
+        hkdf_length_traffic_secret) in
+
+      (* Finished *)
+      let middlebox_finished_handshake_context_C = H((client_hello, middlebox_hello_C, encrypted_extensions,
+                                                 middlebox_configuration_C, middlebox_certificate, 
+                                                 middlebox_certificate_verify_C)) in
+      let middlebox_finished_key_C = HKDF_Expand(
+              master_secret_C, 
+        (HKDF_SERVER_FINISHED, empty), 
+        hkdf_length_middlebox_finished_key) in
+      let middlebox_finished_C = HMAC(middlebox_finished_key_C, middlebox_finished_handshake_context_C) in
+
+      (* Encryption: encrypted_extensions, middlebox_configuration_C, middlebox_certificate, 
+                   middlebox_certificate_verify_C, middlebox_finished_C *)
+      (* AEAD: additional_data = empty *)
+      let handshake_middlebox_write_nonce_0_C = xor(handshake_middlebox_write_iv_C, 
+                                               middlebox_seq_num) in
+      let enc_encrypted_extensions_C = AEAD_Encrypt(
+              handshake_middlebox_write_key_C, 
+              handshake_middlebox_write_nonce_0_C, 
+        (encrypted_extensions, record_type), 
+        empty) in 
+
+      let handshake_middlebox_write_nonce_1_C = xor(handshake_middlebox_write_iv_C, 
+                                               inc(middlebox_seq_num)) in
+      let enc_middlebox_configuration_C = AEAD_Encrypt(
+              handshake_middlebox_write_key_C, 
+              handshake_middlebox_write_nonce_1_C, 
+        (middlebox_configuration_C, record_type), 
+        empty) in 
+
+      let handshake_middlebox_write_nonce_2_C = xor(handshake_middlebox_write_iv_C, 
+                                               inc(inc(middlebox_seq_num))) in
+      let enc_middlebox_certificate_C = AEAD_Encrypt(
+              handshake_middlebox_write_key_C, 
+              handshake_middlebox_write_nonce_2_C, 
+        (middlebox_certificate, record_type), 
+        empty) in 
+
+      let handshake_middlebox_write_nonce_3_C = xor(handshake_middlebox_write_iv_C, 
+                                               inc(inc(inc(middlebox_seq_num)))) in
+      let enc_middlebox_certificate_verify_C = AEAD_Encrypt(
+              handshake_middlebox_write_key_C, 
+        handshake_middlebox_write_nonce_3_C, 
+        (middlebox_certificate_verify_C, record_type), 
+        empty) in 
+
+      let handshake_middlebox_write_nonce_4_C = xor(handshake_middlebox_write_iv_C, 
+                                               inc(inc(inc(inc(middlebox_seq_num))))) in
+      let enc_middlebox_finished_C = AEAD_Encrypt(
+              handshake_middlebox_write_key_C, 
+        handshake_middlebox_write_nonce_4_C, 
+        (middlebox_finished_C, record_type), 
+        empty) in
+
+      (* Event begin: authentication *)
+      event beginMiddlebox_C(client_random, middlebox_random, middlebox_cipher_suite, xes_C, traffic_secret_0_C);
+
+
+      out(c, (server_hello, enc_encrypted_extensions, enc_server_configuration, 
+              enc_server_certificate, enc_server_certificate_verify, enc_server_finished,
+              middlebox_hello_C, enc_encrypted_extensions_C, enc_middlebox_configuration_C, 
+              enc_middlebox_certificate_C, enc_middlebox_certificate_verify_C, enc_middlebox_finished_C));
+
+      (* Key S-M Computation *)
+      (****************************************)
+      let static_secret_S = exp(server_key_share, Z2) in
+      let ephemeral_secret_S = exp(server_key_share, Z2) in
+      let xss_S = HKDF_Extract(hkdf_zeros, static_secret_S) in
+      let xes_S = HKDF_Extract(hkdf_zeros, ephemeral_secret_S) in
+
+      (* Key C-M Handshake traffic keys *)
+      let handshake_context_S = H((middlebox_hello_S, server_hello)) in
+
+      let handshake_middlebox_write_key_S = HKDF_Expand(
+              xes_S, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_MIDDLEBOX_WRITE_KEY), handshake_context_S), 
+        hkdf_length_handshake_middlebox_write_key) in
+
+      let handshake_server_write_key = HKDF_Expand(
+              xes_S, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_SERVER_WRITE_KEY), handshake_context_S), 
+        hkdf_length_handshake_server_write_key) in
+
+      let handshake_middlebox_write_iv_S = HKDF_Expand(
+              xes_S, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_MIDDLEBOX_WRITE_IV), handshake_context_S), 
+        hkdf_length_handshake_middlebox_write_IV) in
+
+      let handshake_server_write_iv = HKDF_Expand(
+              xes_S, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_SERVER_WRITE_IV), handshake_context_S), 
+        hkdf_length_handshake_server_write_IV) in
+
+      (* Key S-M Middlebox configuration: optional *) 
+      let middlebox_configuration_S = (configuration_id, expiration_date, middlebox_key_share_S, 
+                                  early_data_type) in
+
+      (* CertificateVerify: optional *)
+      let handshake_hashed_data_S = H((server_hello, middlebox_hello_S, encrypted_extensions,
+                                     middlebox_configuration_S, middlebox_certificate)) in 
+      let middlebox_certificate_verify_S = sign(handshake_hashed_data_S, skM) in
+
+       (* mss_S, mes_S, master_secret_S, traffic_secret_0_S *) 
+      let handshake_hash_S = H((middlebox_hello_S, server_hello, encrypted_extensions,
+                              middlebox_configuration_S, middlebox_certificate, 
+                              middlebox_certificate_verify_S)) in
+      let mss_S = HKDF_Expand(
+              xss_S, 
+        (HKDF_LABAL_EXPANDED_STATIC_SECRET, handshake_hash_S), 
+        hkdf_length_mss) in
+                                  
+      let mes_S = HKDF_Expand(
+              xes_S, 
+        (HKDF_LABEL_EXPANDED_EPHEMERAL_SECRET, handshake_hash_S), 
+        hkdf_length_mes) in
+      let master_secret_S = HKDF_Extract(mss_S, mes_S) in 
+      let traffic_secret_0_S = HKDF_Expand(
+              master_secret_S, 
+        (HKDF_LABEL_TRAFFIC_SECRET, handshake_hash_S), 
+        hkdf_length_traffic_secret) in
+
+      (* Finished *)
+      let middlebox_finished_handshake_context_S = H((server_hello, middlebox_hello_S, encrypted_extensions,
+                                                 middlebox_configuration_S, middlebox_certificate, 
+                                                 middlebox_certificate_verify_S)) in
+      let middlebox_finished_key_S = HKDF_Expand(
+              master_secret_S, 
+        (HKDF_SERVER_FINISHED, empty), 
+        hkdf_length_middlebox_finished_key) in
+      let middlebox_finished_S = HMAC(middlebox_finished_key_S, middlebox_finished_handshake_context_S) in
+
+      (* Encryption: encrypted_extensions, middlebox_configuration_S, middlebox_certificate, 
+                   middlebox_certificate_verify_S, middlebox_finished_S *)
+      (* AEAD: additional_data = empty *)
+      let handshake_middlebox_write_nonce_0_S = xor(handshake_middlebox_write_iv_S, 
+                                               middlebox_seq_num) in
+      let enc_encrypted_extensions_S = AEAD_Encrypt(
+              handshake_middlebox_write_key_S, 
+              handshake_middlebox_write_nonce_0_S, 
+        (encrypted_extensions, record_type), 
+        empty) in 
+
+      let handshake_middlebox_write_nonce_1_S = xor(handshake_middlebox_write_iv_S, 
+                                               inc(middlebox_seq_num)) in
+      let enc_middlebox_configuration_S = AEAD_Encrypt(
+              handshake_middlebox_write_key_S, 
+              handshake_middlebox_write_nonce_1_S, 
+        (middlebox_configuration_S, record_type), 
+        empty) in 
+
+      let handshake_middlebox_write_nonce_2_S = xor(handshake_middlebox_write_iv_S, 
+                                               inc(inc(middlebox_seq_num))) in
+      let enc_middlebox_certificate_S = AEAD_Encrypt(
+              handshake_middlebox_write_key_S, 
+              handshake_middlebox_write_nonce_2_S, 
+        (middlebox_certificate, record_type), 
+        empty) in 
+
+      let handshake_middlebox_write_nonce_3_S = xor(handshake_middlebox_write_iv_S, 
+                                               inc(inc(inc(middlebox_seq_num)))) in
+      let enc_middlebox_certificate_verify_S = AEAD_Encrypt(
+              handshake_middlebox_write_key_S, 
+        handshake_middlebox_write_nonce_3_S, 
+        (middlebox_certificate_verify_S, record_type), 
+        empty) in 
+
+      let handshake_middlebox_write_nonce_4_S = xor(handshake_middlebox_write_iv_S, 
+                                               inc(inc(inc(inc(middlebox_seq_num))))) in
+      let enc_middlebox_finished_S = AEAD_Encrypt(
+              handshake_middlebox_write_key_S, 
+        handshake_middlebox_write_nonce_4_S, 
+        (middlebox_finished_S, record_type), 
+        empty) in    
+
+      (****************************************)
+
+      in(c, (enc_client_finished: bitstring, enc_client_finished_M: bitstring));
+
+      (* Client authentication *)
+      (* Decryption: client_finished_M *)
+      let handshake_client_write_nonce_0 = xor(handshake_client_write_iv, 
+                                               client_seq_num) in
+      let (client_finished_M:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_client_write_key, 
+        handshake_client_write_nonce_0, 
+        enc_client_finished_M, 
+        empty) in 
+
+      let client_finished_handshake_context = H((client_hello, middlebox_hello_C, encrypted_extensions,
+                                                 middlebox_configuration_C, middlebox_certificate, 
+                                                 middlebox_certificate_verify_C, middlebox_finished_C)) in
+      let client_finished_key_M = HKDF_Expand(
+              master_secret_C, 
+        (HKDF_CLIENT_FINISHED, empty), 
+        hkdf_length_client_finished_key) in
+      if client_finished_M = HMAC(client_finished_key_M, client_finished_handshake_context) then
+
+
+      (* Server authentication *)
+      (* Decryption: encrypted_extensions_S, server_configuration, server_certificate, server_certificate_verify, server_finished *)
+
+      let handshake_server_write_nonce_0 = xor(handshake_server_write_iv, 
+                                               server_seq_num) in
+      let (encrypted_extensions_S:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_server_write_key, 
+              handshake_server_write_nonce_0, 
+        enc_encrypted_extensions_M, 
+        empty) in
+
+      let handshake_server_write_nonce_1 = xor(handshake_server_write_iv, 
+                                               inc(server_seq_num)) in                                           
+      let (server_configuration:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_server_write_key, 
+              handshake_server_write_nonce_1, 
+        enc_server_configuration_M, 
+        empty) in
+
+      let handshake_server_write_nonce_2 = xor(handshake_server_write_iv, 
+                                               inc(inc(server_seq_num))) in
+      let (server_certificate:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_server_write_key, 
+              handshake_server_write_nonce_2, 
+        enc_server_certificate_M, 
+        empty) in
+
+      let handshake_server_write_nonce_3 = xor(handshake_server_write_iv, 
+                                               inc(inc(inc(server_seq_num)))) in
+      let (server_certificate_verify:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_server_write_key, 
+        handshake_server_write_nonce_3, 
+        enc_server_certificate_verify_M, 
+        empty) in
+
+      let handshake_server_write_nonce_4 = xor(handshake_server_write_iv, 
+                                               inc(inc(inc(inc(server_seq_num))))) in
+      let (server_finished:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_server_write_key, 
+        handshake_server_write_nonce_4, 
+        enc_server_finished_M, 
+        empty) in 
+
+      if encrypted_extensions = empty then
+
+      let (=HostInfoCA, =HostInfoS, pkS: bitstring, signCA_pkS: bitstring) = server_certificate in 
+      if verify(signCA_pkS, H((HostInfoCA, HostInfoS, pkS)), pkCA) = true then
+
+
+      let server_finished_handshake_context = H((middlebox_hello_S, server_hello, encrypted_extensions_S,
+                                                 server_configuration, server_certificate, 
+                                                 server_certificate_verify)) in
+      let server_finished_key = HKDF_Expand(
+              master_secret_S, 
+        (HKDF_SERVER_FINISHED, empty), 
+        hkdf_length_server_finished_key) in
+
+      if server_finished = HMAC(server_finished_key, server_finished_handshake_context) then
+
+
+      out(c, (enc_client_finished, enc_encrypted_extensions_S, enc_middlebox_configuration_S, enc_middlebox_certificate_S, enc_middlebox_certificate_verify_S, enc_middlebox_finished_S));
+
+      (* Event end: authentication *)
+      event endMiddlebox_S(middlebox_random, server_random, middlebox_cipher_suite, xes_S, traffic_secret_0_S);
+    
+      0.
+
+      
+(******************************************************************)
+(* Server process *)
+
+let processServer(skS: bitstring, pkS: bitstring, server_certificate: bitstring, pkCA: bitstring)=
+    (* Setup *)
+      in(c, (server_version: bitstring, server_cipher_suite: bitstring));
+
+    (* Server input *)
+      in(c, client_middlebox_hello: bitstring);
+
+      (* client_middlebox_hello *)
+      let (client_hello: bitstring, middlebox_hello_S: bitstring) = client_middlebox_hello in
+      let (client_version: bitstring, client_random: bitstring, client_legacy_session_id: bitstring,
+           client_cipher_suites: bitstring, legacy_compression_methods: bitstring, 
+           client_key_shares: bitstring) = client_hello in
+      let (middlebox_version: bitstring, middlebox_random: bitstring,
+           middlebox_cipher_suite: bitstring, middlebox_key_share_S: bitstring) = middlebox_hello_S in
+
+      if client_version = server_version &&
+         client_cipher_suites = server_cipher_suite &&
+         legacy_compression_methods = null then 
+
+    (* ServerHello + key_share *)
+      new server_random: bitstring;
+      new Y: bitstring;
+      let server_key_share = exp(g, Y) in  (* g^Y *)
+      let server_hello = (server_version, server_random, server_cipher_suite, server_key_share) in 
+
+    (* SS, ES, xSS, xES *) (* Full handshake: SS = ES *)
+      let static_secret = exp(client_key_shares, Y) in     (* SS: (g^{X})^Y = g^{XY} *)
+      let ephemeral_secret = exp(client_key_shares, Y) in  (* ES: (g^{X})^Y = g^{XY} *)
+      (* xes or xss is PRK *)
+      let xss = HKDF_Extract(hkdf_zeros, static_secret) in
+      let xes = HKDF_Extract(hkdf_zeros, ephemeral_secret) in
+
+    (* Middlebox ES, xES*)
+      let static_secret_M = exp(middlebox_key_share_S, Y) in
+      let ephemeral_secret_M = exp(middlebox_key_share_S, Y) in
+      let xss_M = HKDF_Extract(hkdf_zeros, static_secret_M) in
+      let xes_M = HKDF_Extract(hkdf_zeros, ephemeral_secret_M) in
+
+
+    (* Handshake traffic keys: client_write_key, server_write_key, 
+                               client_write_iv, server_write_iv *)
+      let handshake_context = H((client_hello, server_hello)) in
+
+      let handshake_client_write_key = HKDF_Expand(
+              xes, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_CLIENT_WRITE_KEY), handshake_context), 
+        hkdf_length_handshake_client_write_key) in
+
+      let handshake_server_write_key = HKDF_Expand(
+              xes, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_SERVER_WRITE_KEY), handshake_context), 
+        hkdf_length_handshake_server_write_key) in
+
+      let handshake_client_write_iv = HKDF_Expand(
+              xes, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_CLIENT_WRITE_IV), handshake_context), 
+        hkdf_length_handshake_client_write_IV) in
+
+      let handshake_server_write_iv = HKDF_Expand(
+              xes, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_SERVER_WRITE_IV), handshake_context), 
+        hkdf_length_handshake_server_write_IV) in
+
+    (* Middlebox Handshake traffic keys: middlebox_write_key, server_write_key, 
+                               middlebox_write_iv, server_write_iv *)
+      let handshake_context_M = H((middlebox_hello_S, server_hello)) in
+
+      let handshake_middlebox_write_key = HKDF_Expand(
+              xes_M, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_MIDDLEBOX_WRITE_KEY), handshake_context_M), 
+        hkdf_length_handshake_middlebox_write_key) in
+
+      let handshake_server_write_key_M = HKDF_Expand(
+              xes_M, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_SERVER_WRITE_KEY), handshake_context_M), 
+        hkdf_length_handshake_server_write_key) in
+
+      let handshake_middlebox_write_iv = HKDF_Expand(
+              xes_M, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_MIDDLEBOX_WRITE_IV), handshake_context_M), 
+        hkdf_length_handshake_middlebox_write_IV) in
+
+      let handshake_server_write_iv_M = HKDF_Expand(
+              xes_M, 
+        ((HKDF_LABEL_HANDSHAKE_KEY_EXPANSION, HKDF_LABEL_SERVER_WRITE_IV), handshake_context_M), 
+        hkdf_length_handshake_server_write_IV) in
+
+    (* EncryptedExtensions *)
+      let encrypted_extensions = empty in 
+
+    (* CertificateRequest: optional *)
+      (* Omitted *)
+
+    (* ServerConfiguration: optional *) 
+      new configuration_id: bitstring;
+      new expiration_date: bitstring;
+      let static_key_share = server_key_share in 
+      let server_configuration = (configuration_id, expiration_date, static_key_share, 
+                                  early_data_type) in 
+
+    (* Certificate: optional *)
+      (* Main process *)
+
+    (* CertificateVerify: optional *)
+      let handshake_hashed_data = H((client_hello, server_hello, encrypted_extensions,
+                                     server_configuration, server_certificate)) in 
+      let server_certificate_verify = sign(handshake_hashed_data, skS) in
+
+    (* Middlebox CertificateVerify *)
+      let handshake_hashed_data_M = H((middlebox_hello_S, server_hello, encrypted_extensions,
+                                     server_configuration, server_certificate)) in 
+      let server_certificate_verify_M = sign(handshake_hashed_data_M, skS) in  
+
+    (* mSS, mES, master_secret,  *) 
+      let handshake_hash = H((client_hello, server_hello, encrypted_extensions,
+                              server_configuration, server_certificate, 
+                              server_certificate_verify)) in
+      let mss = HKDF_Expand(
+              xss, 
+        (HKDF_LABAL_EXPANDED_STATIC_SECRET, handshake_hash), 
+        hkdf_length_mss) in
+      let mes = HKDF_Expand(
+              xes, 
+        (HKDF_LABEL_EXPANDED_EPHEMERAL_SECRET, handshake_hash), 
+        hkdf_length_mes) in
+      let master_secret = HKDF_Extract(mss, mes) in 
+      let traffic_secret_0 = HKDF_Expand(
+              master_secret, 
+        (HKDF_LABEL_TRAFFIC_SECRET, handshake_hash), 
+        hkdf_length_traffic_secret) in
+
+    (* Middlebox mss_M, mES_M, master_secret_M, traffic_secret_0_M *) 
+      let handshake_hash_M = H((middlebox_hello_S, server_hello, encrypted_extensions,
+                              server_configuration, server_certificate, 
+                              server_certificate_verify_M)) in
+      let mss_M = HKDF_Expand(
+              xss_M, 
+        (HKDF_LABAL_EXPANDED_STATIC_SECRET, handshake_hash_M), 
+        hkdf_length_mss) in
+                                  
+      let mes_M = HKDF_Expand(
+              xes_M, 
+        (HKDF_LABEL_EXPANDED_EPHEMERAL_SECRET, handshake_hash_M), 
+        hkdf_length_mes) in
+      let master_secret_M = HKDF_Extract(mss_M, mes_M) in 
+      let traffic_secret_0_M = HKDF_Expand(
+              master_secret_M, 
+        (HKDF_LABEL_TRAFFIC_SECRET, handshake_hash_M), 
+        hkdf_length_traffic_secret) in
+
+    (* Finished *) (* 1-RTT (Server) *)
+      let server_finished_handshake_context = H((client_hello, server_hello, encrypted_extensions,
+                                                 server_configuration, server_certificate, 
+                                                 server_certificate_verify)) in
+      let server_finished_key = HKDF_Expand(
+              master_secret, 
+        (HKDF_SERVER_FINISHED, empty), 
+        hkdf_length_server_finished_key) in
+      let server_finished = HMAC(server_finished_key, server_finished_handshake_context) in
+
+    (* Middlebox Finished *) (* 1-RTT (Server) *)
+      let server_finished_handshake_context_M = H((middlebox_hello_S, server_hello, encrypted_extensions,
+                                                 server_configuration, server_certificate, 
+                                                 server_certificate_verify_M)) in
+      let server_finished_key_M = HKDF_Expand(
+              master_secret_M, 
+        (HKDF_SERVER_FINISHED, empty), 
+        hkdf_length_server_finished_key) in
+      let server_finished_M = HMAC(server_finished_key_M, server_finished_handshake_context_M) in
+
+    (* Encryption: encrypted_extensions, server_configuration, server_certificate, 
+                   server_certificate_verify, server_finished *)
+      (* AEAD: additional_data = empty *)
+      let handshake_server_write_nonce_0 = xor(handshake_server_write_iv, 
+                                               server_seq_num) in
+      let enc_encrypted_extensions = AEAD_Encrypt(
+              handshake_server_write_key, 
+              handshake_server_write_nonce_0, 
+        (encrypted_extensions, record_type), 
+        empty) in 
+
+      let handshake_server_write_nonce_1 = xor(handshake_server_write_iv, 
+                                               inc(server_seq_num)) in
+      let enc_server_configuration = AEAD_Encrypt(
+              handshake_server_write_key, 
+              handshake_server_write_nonce_1, 
+        (server_configuration, record_type), 
+        empty) in 
+
+      let handshake_server_write_nonce_2 = xor(handshake_server_write_iv, 
+                                               inc(inc(server_seq_num))) in
+      let enc_server_certificate = AEAD_Encrypt(
+              handshake_server_write_key, 
+              handshake_server_write_nonce_2, 
+        (server_certificate, record_type), 
+        empty) in 
+
+      let handshake_server_write_nonce_3 = xor(handshake_server_write_iv, 
+                                               inc(inc(inc(server_seq_num)))) in
+      let enc_server_certificate_verify = AEAD_Encrypt(
+              handshake_server_write_key, 
+        handshake_server_write_nonce_3, 
+        (server_certificate_verify, record_type), 
+        empty) in 
+
+      let handshake_server_write_nonce_4 = xor(handshake_server_write_iv, 
+                                               inc(inc(inc(inc(server_seq_num))))) in
+      let enc_server_finished = AEAD_Encrypt(
+              handshake_server_write_key, 
+        handshake_server_write_nonce_4, 
+        (server_finished, record_type), 
+        empty) in
+
+    (* Middlebox Encryption: encrypted_extensions, server_configuration, server_certificate, 
+                   server_certificate_verify_M, server_finished_M *)
+      (* AEAD: additional_data = empty *)
+      let handshake_server_write_nonce_0_M = xor(handshake_server_write_iv_M, 
+                                               server_seq_num) in
+      let enc_encrypted_extensions_M = AEAD_Encrypt(
+              handshake_server_write_key_M, 
+              handshake_server_write_nonce_0_M, 
+        (encrypted_extensions, record_type), 
+        empty) in 
+
+      let handshake_server_write_nonce_1_M = xor(handshake_server_write_iv_M, 
+                                               inc(server_seq_num)) in
+      let enc_server_configuration_M = AEAD_Encrypt(
+              handshake_server_write_key_M, 
+              handshake_server_write_nonce_1_M, 
+        (server_configuration, record_type), 
+        empty) in 
+
+      let handshake_server_write_nonce_2_M = xor(handshake_server_write_iv_M, 
+                                               inc(inc(server_seq_num))) in
+      let enc_server_certificate_M = AEAD_Encrypt(
+              handshake_server_write_key_M, 
+              handshake_server_write_nonce_2_M, 
+        (server_certificate, record_type), 
+        empty) in 
+
+      let handshake_server_write_nonce_3_M = xor(handshake_server_write_iv_M, 
+                                               inc(inc(inc(server_seq_num)))) in
+      let enc_server_certificate_verify_M = AEAD_Encrypt(
+              handshake_server_write_key_M, 
+        handshake_server_write_nonce_3_M, 
+        (server_certificate_verify_M, record_type), 
+        empty) in 
+
+      let handshake_server_write_nonce_4_M = xor(handshake_server_write_iv_M, 
+                                               inc(inc(inc(inc(server_seq_num))))) in
+      let enc_server_finished_M = AEAD_Encrypt(
+              handshake_server_write_key_M, 
+        handshake_server_write_nonce_4_M, 
+        (server_finished_M, record_type), 
+        empty) in
+
+
+    (* Event begin: authentication *)
+      event beginClient(client_random, server_random, server_cipher_suite, xes, traffic_secret_0);
+      event beginMiddlebox_S(middlebox_random, server_random, server_cipher_suite, xes_M, traffic_secret_0_M);
+
+    (* Server output *)
+      out(c, (server_hello, enc_encrypted_extensions, enc_server_configuration, 
+              enc_server_certificate, enc_server_certificate_verify, enc_server_finished, 
+              enc_encrypted_extensions_M, enc_server_configuration_M, 
+              enc_server_certificate_M, enc_server_certificate_verify_M, enc_server_finished_M));
+
+    (* Server input *)
+      in(c, (enc_client_finished: bitstring, enc_encrypted_extensions_S: bitstring, enc_middlebox_configuration_S: bitstring, enc_middlebox_certificate_S: bitstring, enc_middlebox_certificate_verify_S: bitstring, enc_middlebox_finished_S: bitstring));
+
+    (* Decryption: client_finished *)
+      let handshake_client_write_nonce_0 = xor(handshake_client_write_iv, 
+                                               client_seq_num) in
+      let (client_finished:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_client_write_key, 
+        handshake_client_write_nonce_0, 
+        enc_client_finished, 
+        empty) in 
+
+      let client_finished_handshake_context = H((client_hello, server_hello, encrypted_extensions,
+                                                 server_configuration, server_certificate, 
+                                                 server_certificate_verify, server_finished)) in
+      let client_finished_key = HKDF_Expand(
+              master_secret, 
+        (HKDF_CLIENT_FINISHED, empty), 
+        hkdf_length_client_finished_key) in
+      if client_finished = HMAC(client_finished_key, client_finished_handshake_context) then
+
+    (* Middlebox authentication *)
+      (* Decryption: encrypted_extensions_M, middlebox_configuration, middlebox_certificate, middlebox_certificate_verify, middlebox_finished *)
+
+      let handshake_middlebox_write_nonce_0 = xor(handshake_middlebox_write_iv, 
+                                               middlebox_seq_num) in
+      let (encrypted_extensions_S:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_middlebox_write_key, 
+              handshake_middlebox_write_nonce_0, 
+        enc_encrypted_extensions_S, 
+        empty) in
+
+      let handshake_middlebox_write_nonce_1 = xor(handshake_middlebox_write_iv, 
+                                               inc(middlebox_seq_num)) in                                           
+      let (middlebox_configuration:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_middlebox_write_key, 
+              handshake_middlebox_write_nonce_1, 
+        enc_middlebox_configuration_S, 
+        empty) in
+
+      let handshake_middlebox_write_nonce_2 = xor(handshake_middlebox_write_iv, 
+                                               inc(inc(middlebox_seq_num))) in
+      let (middlebox_certificate:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_middlebox_write_key, 
+              handshake_middlebox_write_nonce_2, 
+        enc_middlebox_certificate_S, 
+        empty) in
+
+      let handshake_middlebox_write_nonce_3 = xor(handshake_middlebox_write_iv, 
+                                               inc(inc(inc(middlebox_seq_num)))) in
+      let (middlebox_certificate_verify:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_middlebox_write_key, 
+        handshake_middlebox_write_nonce_3, 
+        enc_middlebox_certificate_verify_S, 
+        empty) in
+
+      let handshake_middlebox_write_nonce_4 = xor(handshake_middlebox_write_iv, 
+                                               inc(inc(inc(middlebox_seq_num)))) in
+      let (middlebox_finished:bitstring, =record_type) = AEAD_Decrypt(
+              handshake_middlebox_write_key, 
+        handshake_middlebox_write_nonce_4, 
+        enc_middlebox_finished_S, 
+        empty) in
+
+
+      if encrypted_extensions_S = empty then
+
+      let (=HostInfoCA, =HostInfoM, pkM: bitstring, signCA_pkM: bitstring) = middlebox_certificate in 
+      if verify(signCA_pkM, H((HostInfoCA, HostInfoM, pkM)), pkCA) = true then
+
+      let middlebox_finished_handshake_context = H((server_hello, middlebox_hello_S, encrypted_extensions_S,
+                                                 middlebox_configuration, middlebox_certificate, 
+                                                 middlebox_certificate_verify)) in
+      let middlebox_finished_key = HKDF_Expand(
+              master_secret_M, 
+        (HKDF_SERVER_FINISHED, empty), 
+        hkdf_length_middlebox_finished_key) in
+      if middlebox_finished = HMAC(middlebox_finished_key, middlebox_finished_handshake_context) then
+
+   (* Application data traffic keys: client_write_key, server_write_key, 
+                                      client_write_iv, server_write_iv *)
+      let application_handshake_context = H((client_hello, server_hello, encrypted_extensions,
+                                             server_configuration, server_certificate, 
+                                             server_certificate_verify, server_finished)) in
+
+      let application_client_write_key = HKDF_Expand(
+              traffic_secret_0, 
+        ((HKDF_LABEL_APPLICATION_DATA_KEY_EXPANSION, HKDF_LABEL_CLIENT_WRITE_KEY), 
+                application_handshake_context), 
+        hkdf_length_application_client_write_key) in
+
+      let application_server_write_key = HKDF_Expand(
+              traffic_secret_0, 
+        ((HKDF_LABEL_APPLICATION_DATA_KEY_EXPANSION, HKDF_LABEL_SERVER_WRITE_KEY), 
+                application_handshake_context), 
+        hkdf_length_application_server_write_key) in
+
+      let application_client_write_iv = HKDF_Expand(
+              traffic_secret_0, 
+        ((HKDF_LABEL_APPLICATION_DATA_KEY_EXPANSION, HKDF_LABEL_CLIENT_WRITE_IV), 
+                application_handshake_context), 
+        hkdf_length_application_client_write_IV) in
+
+      let application_server_write_iv = HKDF_Expand(
+              traffic_secret_0, 
+        ((HKDF_LABEL_APPLICATION_DATA_KEY_EXPANSION, HKDF_LABEL_SERVER_WRITE_IV), 
+                application_handshake_context), 
+        hkdf_length_application_server_write_IV) in
+
+    (* Application Data *) (* Secrecy *)
+      let application_server_write_nonce_1 = xor(application_server_write_iv, 
+                                                 inc(client_seq_num)) in 
+
+      new AppDataServer: bitstring;
+      out(c, AEAD_Encrypt(
+                  application_server_write_key, 
+                  application_server_write_nonce_1, 
+                  (AppDataServer, record_type), 
+                  empty));
+
+      event begintest(packet, server_certificate);
+      0.
+
+
+(******************************************************************)
+(* Certificate Authority (CA) process *)
+
+let processCA(skCA: bitstring) =
+      in(c, (HostInfoX: bitstring, pkX: bitstring));
+      if HostInfoX <> HostInfoC && 
+         HostInfoX <> HostInfoS &&
+         HostInfoX <> HostInfoCA then 
+      let signCA_pkX = sign(H((HostInfoCA, HostInfoX, pkX)), skCA) in 
+      let X_certificate = (HostInfoCA, HostInfoX, pkX, signCA_pkX) in
+      out(c, X_certificate).
+
+
+(******************************************************************)
+(* Main process *)
+
+process
+    (* Certificate Authority (CA) : skCA, pkCA *)
+      new skCA: bitstring;
+      let pkCA = pk(skCA) in
+      out(c, pkCA);
+    (* Server key : skS, pkS *)
+      new skS: bitstring;
+      let pkS = pk(skS) in 
+    (* Middlebox key : skM, pkM *)
+      new skM: bitstring;
+      let pkM = pk(skM) in 
+    (* (Server) Certificate *)
+      let signCA_pkS = sign(H((HostInfoCA, HostInfoS, pkS)), skCA) in 
+      let server_certificate = (HostInfoCA, HostInfoS, pkS, signCA_pkS) in
+      out(c, server_certificate);
+    (* (Middlebox) Certificate *)
+      let signCA_pkM = sign(H((HostInfoCA, HostInfoM, pkM)), skCA) in 
+      let middlebox_certificate = (HostInfoCA, HostInfoM, pkM, signCA_pkS) in
+      out(c, server_certificate);
+    ((!processClient(pkCA)) |
+     (!processMiddlebox(skM, pkM, middlebox_certificate, pkCA)) |
+     (!processServer(skS, pkS, server_certificate, pkCA)) | 
+     (!processCA(skCA))
+    )
+
+
+(******************************************************************)
+(* end of file *)

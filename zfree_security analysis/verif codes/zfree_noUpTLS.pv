@@ -1,0 +1,276 @@
+(***************************************************************************
+ *                                                                         *
+ *  Formal Verification of TLS 1.3 Full Handshake Protocol Using ProVerif  *
+ *                                                                         *
+ *  Kenichi Arai                                                           *
+ *                                                                         *
+ *  Copyright (C) Nagasaki University 2015-2016                            *
+ *                                                                         *
+ ***************************************************************************)
+
+(*
+    This file is free software; you can redistribute it and/or modify 
+    it under the terms of the BSD License.
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+    See the BSD license for more details (in file LICENSEBSD).
+*)
+
+(* 
+The Transport Layer Security (TLS) Protocol Version 1.3 
+    draft-ietf-tls-tls13-11 (January 22, 2016)
+
+===================================================================================
+       proxy1                                                   proxy2
+
+Key  / proxy1Hello
+Exch \  + key_share              -------->
+                                                           proxy2Hello  \ Key
+                                                           + key_share  / Exch
+                                                 {EncryptedExtensions}  ^
+                                                 {CertificateRequest*}  | proxy2
+                                                {proxy2Configuration*}  v Params
+                                                        {Certificate*}  ^
+                                                  {CertificateVerify*}  | Auth
+                                 <--------                  {Finished}  v
+     ^ {Certificate*}
+Auth | {CertificateVerify*}
+     v {Finished}                -------->
+       [Application Data]        <------->         [Application Data]
+
+
+              + Indicates extensions sent in the
+                previously noted message.
+
+              * Indicates optional or situation-dependent
+                messages that are not always sent.
+
+              {} Indicates messages protected using keys
+                 derived from the ephemeral secret.
+
+              [] Indicates messages protected using keys
+                 derived from the master secret.
+===================================================================================
+
+             Message flow for full TLS Handshake
+*)
+
+free c: channel.
+(* Hash used in proxies *)
+fun HASH(bitstring): bitstring.
+
+(* Hash *)
+fun H(bitstring): bitstring.
+
+(* Signature *)
+fun sign(bitstring, bitstring): bitstring.
+fun pk(bitstring): bitstring.
+  reduc forall x: bitstring, sk: bitstring; verify(sign(x, sk), x, pk(sk)) = true.
+
+(* Symmetric key encryption *)
+
+fun senc(bitstring, bitstring): bitstring.
+reduc forall m: bitstring, k: bitstring; sdec(senc(m,k),k) = m.
+
+
+(* Asymmetric key encryption *)
+
+fun aenc(bitstring, bitstring): bitstring.
+reduc forall m: bitstring, sk: bitstring; adec(aenc(m,pk(sk)),sk) = m.
+
+
+(* Host Information *)
+free HostInfoC, HostInfoS, HostInfoCA: bitstring.
+
+(* CP certificate *)
+free HostInfoCP:bitstring [private].
+
+free AppData: bitstring [private].
+
+(******************************************************************)
+(* Queries1: secrecy of application data *)
+query attacker(AppData).
+
+(* Queries2: verify integrity of response data *)
+event endResponseVerif(bitstring).
+event beginResponseVerif(bitstring).
+
+query response_data: bitstring;
+  event(endResponseVerif(response_data)) ==> event(beginResponseVerif(response_data)).
+
+(* Queries3: authentication server identity *)
+event endServerVerif(bitstring).
+event beginServerVerif(bitstring).
+
+query server_identity: bitstring;
+  inj-event(endServerVerif(server_identity)) ==> inj-event(beginServerVerif(server_identity)).
+
+(******************************************************************)
+(* Client process *)
+
+let processClient() = 
+
+  in(c, (response:bitstring, server_certificate: bitstring));
+
+  (* Application Data *) (* Secrecy *)
+    out(c, AppData).
+
+
+(******************************************************************)
+(* proxy1 process *)
+
+let processproxy1(skC: bitstring, pkC: bitstring, pkCA: bitstring, CP_certificate: bitstring)=
+    (* Setup *)
+      in(c, (proxy1_version: bitstring, proxy1_cipher_suites: bitstring));
+
+    (* proxy1 Hello*)
+      new proxy1_random: bitstring;
+      let proxy1_hello = (proxy1_version, proxy1_random, proxy1_cipher_suites, pkC) in
+
+    (* proxy1 output *)
+      out(c, proxy1_hello);
+
+    (* proxy1 input *)
+      in(c, proxy2_hello: bitstring);
+      let (proxy2_version: bitstring, proxy2_random: bitstring, proxy2_cipher_suite: bitstring, proxy2_certificate: bitstring) = proxy2_hello in
+
+      if proxy2_version = proxy1_version && proxy2_cipher_suite = proxy1_cipher_suites then
+
+      let (=HostInfoCA, =HostInfoS, pkS: bitstring, signCA_pkS: bitstring) = proxy2_certificate in 
+      if verify(signCA_pkS, H((HostInfoCA, HostInfoS, pkS)), pkCA) = true then
+
+      if proxy2_certificate = CP_certificate then
+
+      new pre_masterkey: bitstring;
+
+      (* Hash used to generate masterkey *)
+      let masterkey = H((proxy1_random, proxy2_random, pre_masterkey)) in 
+
+      let enc_proxy1_finished = aenc(pre_masterkey, pkS) in
+
+    (* proxy1 output *)
+      out(c, enc_proxy1_finished);
+
+    (* Event end: authentication *)
+      in(c, enc_proxy2_finished: bitstring);
+      let proxy2_masterkey = adec(enc_proxy2_finished, pkS) in
+      if proxy2_masterkey = masterkey then 
+
+    (* verify hashed response *) (* Secrecy *)
+      in(c, response: bitstring);
+      let response_p1 = response in
+      let Hresponse_p1 = response_p1 in
+
+      in(c, enc_Hresponse_p2: bitstring);
+      let Hresponse_p2 = sdec(enc_Hresponse_p2, masterkey) in
+      if Hresponse_p1 = Hresponse_p2 then
+
+      in(c, (response:bitstring, server_certificate:bitstring));
+      (* end query 2 and 3 *)
+      event endResponseVerif(response);
+      event endServerVerif(server_certificate);
+      0.
+      
+(******************************************************************)
+(* proxy2 process *)
+
+let processproxy2(skS: bitstring, pkS: bitstring, server_certificate: bitstring, pkCA: bitstring)=
+    (* Setup *)
+      in(c, (proxy2_version: bitstring, proxy2_cipher_suite: bitstring));
+
+    (* proxy2 input *)
+      in(c, proxy1_hello: bitstring);
+      let (proxy1_version: bitstring, proxy1_random: bitstring, proxy1_cipher_suites: bitstring, pkC: bitstring) = proxy1_hello in
+
+      if proxy1_version = proxy2_version && proxy1_cipher_suites = proxy2_cipher_suite then
+
+    (* proxy2Hello , session key*)
+      new proxy2_random: bitstring;
+      new session_key: bitstring;
+      let enc_session_key = aenc(session_key, pkC) in
+      let proxy2_hello = (proxy2_version, proxy2_random, proxy2_cipher_suite, server_certificate, enc_session_key) in
+
+    (* proxy2 output *)
+      out(c, proxy2_hello);
+
+    (* proxy2 input*)
+      in(c, proxy1_finished: bitstring);
+      let pre_masterkey = adec(proxy1_finished, skS) in
+
+      (* Hash used to generate masterkey *)
+      let masterkey = H((proxy1_random, proxy2_random, pre_masterkey)) in
+
+    (* proxy2 output *)
+      let enc_proxy2_finished = adec(masterkey, skS) in
+      out(c, enc_proxy2_finished);
+
+    (* verify hashed response *) (* Secrecy *)
+      in(c, response: bitstring);
+      let response_p2 = response in
+      let Hresponse_p2 = HASH(response_p2) in
+      let enc_Hresponse_p2 = senc(Hresponse_p2, masterkey) in
+      out(c, enc_Hresponse_p2).
+
+
+(******************************************************************)
+
+(* server process *)
+
+let processServer(server_certificate: bitstring) = 
+  new response: bitstring;
+  out(c, (response, server_certificate));
+
+  (* begin query 2 & 3 *)
+  event beginResponseVerif(response);
+  event beginServerVerif(server_certificate);
+
+  (* Application Data *) (* Secrecy *)
+      in(c, AppData: bitstring).
+
+(******************************************************************)
+(* Certificate Authority (CA) process *)
+let processCA(skCA: bitstring) =
+      in(c, (HostInfoX: bitstring, pkX: bitstring));
+      if HostInfoX <> HostInfoC && 
+         HostInfoX <> HostInfoS &&
+         HostInfoX <> HostInfoCA then 
+      let signCA_pkX = sign(H((HostInfoCA, HostInfoX, pkX)), skCA) in 
+      let X_certificate = (HostInfoCA, HostInfoX, pkX, signCA_pkX) in
+      out(c, X_certificate).
+
+
+(******************************************************************)
+(* Main process *)
+
+process
+    (* Certificate Authority (CA) : skCA, pkCA *)
+      new skCA: bitstring;
+      let pkCA = pk(skCA) in
+      out(c, pkCA);
+    (* proxy1 key : skC, pkC *)
+      new skC: bitstring;
+      let pkC = pk(skC) in
+    (* proxy2 key : skS, pkS *)
+      new skS: bitstring;
+      let pkS = pk(skS) in
+    (* CP key : skCP, pkCP *)
+      new skCP: bitstring;
+      let pkCP = pk(skCP) in
+    (* (proxy2) Certificate *)
+      let signCA_pkS = sign(H((HostInfoCA, HostInfoS, pkS)), skCA) in 
+      let server_certificate = (HostInfoCA, HostInfoS, pkS, signCA_pkS) in
+    (* (CP) Certificate *)
+      let signCA_pkCP = sign(H((HostInfoCA, HostInfoCP, pkCP)), skCA) in 
+      let CP_certificate = (HostInfoCA, HostInfoCP, pkCP, signCA_pkCP) in
+
+    ((!processClient()) |
+     (!processproxy1(skC, pkC, pkCA, CP_certificate)) |
+     (!processproxy2(skS, pkS, server_certificate, pkCA)) |
+     (!processCA(skCA)) |
+     (!processServer(server_certificate))
+     )
+
+
+(******************************************************************)
+(* end of file *)

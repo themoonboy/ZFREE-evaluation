@@ -1,0 +1,128 @@
+(***************************************************************************
+ *                                                                         *
+ *  Formal Verification of TLS 1.3 Full Handshake Protocol Using ProVerif  *
+ *                                                                         *
+ *  Kenichi Arai                                                           *
+ *                                                                         *
+ *  Copyright (C) Nagasaki University 2015-2016                            *
+ *                                                                         *
+ ***************************************************************************)
+
+(*
+    This file is free software; you can redistribute it and/or modify 
+    it under the terms of the BSD License.
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+    See the BSD license for more details (in file LICENSEBSD).
+*)
+
+(* 
+The Transport Layer Security (TLS) Protocol Version 1.3 
+    draft-ietf-tls-tls13-11 (January 22, 2016)
+
+===================================================================================
+       Client                                                   Server
+
+Key  / ClientHello
+Exch \  + key_share              -------->
+                                                           ServerHello  \ Key
+                                                           + key_share  / Exch
+                                                 {EncryptedExtensions}  ^
+                                                 {CertificateRequest*}  | Server
+                                                {ServerConfiguration*}  v Params
+                                                        {Certificate*}  ^
+                                                  {CertificateVerify*}  | Auth
+                                 <--------                  {Finished}  v
+     ^ {Certificate*}
+Auth | {CertificateVerify*}
+     v {Finished}                -------->
+       [Application Data]        <------->         [Application Data]
+
+
+              + Indicates extensions sent in the
+                previously noted message.
+
+              * Indicates optional or situation-dependent
+                messages that are not always sent.
+
+              {} Indicates messages protected using keys
+                 derived from the ephemeral secret.
+
+              [] Indicates messages protected using keys
+                 derived from the master secret.
+===================================================================================
+
+             Message flow for full TLS Handshake
+*)
+
+free c: channel.
+
+(* Hash *)
+fun HASH(bitstring): bitstring.
+
+(* Signature *)
+fun sign(bitstring, bitstring): bitstring.
+fun pk(bitstring): bitstring.
+  reduc forall x: bitstring, sk: bitstring; verify(sign(x, sk), x, pk(sk)) = true.
+
+(* Symmetric key encryption *)
+
+fun senc(bitstring, bitstring): bitstring.
+reduc forall m: bitstring, k: bitstring; sdec(senc(m,k),k) = m.
+
+
+(* Asymmetric key encryption *)
+
+fun aenc(bitstring, bitstring): bitstring.
+reduc forall m: bitstring, sk: bitstring; adec(aenc(m,pk(sk)),sk) = m.
+
+
+(* Host Information *)
+free HostInfoC, HostInfoS, HostInfoCA: bitstring.
+
+(* CP certificate *)
+free HostInfoCP:bitstring [private].
+
+
+
+(******************************************************************)
+(* Queries: secrecy *) 
+free AppData: bitstring [private].
+query attacker(AppData). 
+
+(* Queries: authentication *) 
+event endD(bitstring).
+event beginD(bitstring).
+query s: bitstring; 
+  event(endD(s)) ==> event(beginD(s)).
+
+
+(******************************************************************)
+(* Client process *)
+
+let processA()=
+    new data: bitstring;
+    let hdata = HASH(data) in
+    event beginD(hdata);
+    out(c, (data, hdata)).
+
+(******************************************************************)
+(* Proxy process *)
+let processB()=
+    
+    in(c, (data: bitstring, hdata:bitstring));
+    let hhdata = HASH(data) in
+    event endD(hhdata).
+(******************************************************************)
+(* Main process *)
+
+process
+    
+    ((!processA()) |
+     (!processB()) )
+    
+
+
+(******************************************************************)
+(* end of file *)
